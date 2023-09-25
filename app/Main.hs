@@ -1,11 +1,14 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE InstanceSigs #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
 
 module Main where
 
-import Control.Monad (forM, replicateM)
+import Control.Concurrent (threadDelay)
+import Control.Monad (filterM, forM, replicateM)
 import Data.Bifunctor (bimap)
 import Data.Data (Typeable)
 import Data.Foldable (Foldable (foldl'), find)
@@ -33,6 +36,16 @@ split delimiter (x : xs)
   | otherwise = (x : head rest) : tail rest
  where
   rest = split delimiter xs
+lastN :: Int -> [a] -> [a]
+lastN n xs = drop (length xs - n) xs
+
+randomSublist :: [a] -> IO [a]
+randomSublist = filterM (\_ -> randomRIO (False, True))
+
+randomElement :: [a] -> IO a
+randomElement xs = do
+  i <- randomRIO (0, length xs - 1)
+  return $ xs !! i
 
 ---
 
@@ -40,7 +53,13 @@ split delimiter (x : xs)
 data CmdInitBoard
   = CmdRandom
   | CmdDiagonal
-  deriving (Eq, Show)
+  deriving (Eq)
+
+instance Show CmdInitBoard where
+  show :: CmdInitBoard -> String
+  show = \case
+    CmdRandom -> "Random"
+    CmdDiagonal -> "Diagonal"
 
 data CommandLineOption
   = CmdHelp
@@ -127,10 +146,10 @@ helpScreen =
     , "    -g=GEN, --generation=GEN      Specifies the number of generations. GEN must be an integer."
     , "  "
     , "Note:"
-    , "    Either the -r/--random flag or the -d/--diagonal flag must be supplied; both cannot be used at the same time."
+    , "    Either the -r/--random flag or the -d/--diagonal flag can be supplied; both cannot be used at the same time."
     , ""
     , "Examples:"
-    , "    nqueens -r                    # With default size of 8"
+    , "    nqueens -r             "
     , "    nqueens -s=8 -r"
     , "    nqueens --size=10 --diagonal"
     , "    nqueens -s=10 -r -c=0.7 -m=0.2 -p=50 -g=100"
@@ -151,12 +170,16 @@ getDefaultOrOption opts defaultOpt =
   matchesType (CmdGeneration _) (CmdGeneration _) = True
   matchesType _ _ = False
 
-processInitBoard :: [CommandLineOption] -> Int -> Int -> IO Population
+processInitBoard :: [CommandLineOption] -> Int -> Int -> IO (CmdInitBoard, Population)
 processInitBoard opts size popsize = do
   let initBoardOpt = filter isCmdInitBoard opts
   case initBoardOpt of
-    (CmdInitBoard b : _) -> handleInitBoard b
-    _ -> handleInitBoard CmdDiagonal
+    (CmdInitBoard b : _) -> do
+      population <- handleInitBoard b
+      return (b, population)
+    _ -> do
+      population <- handleInitBoard CmdDiagonal
+      return (CmdDiagonal, population)
  where
   isCmdInitBoard (CmdInitBoard _) = True
   isCmdInitBoard _ = False
@@ -168,37 +191,55 @@ processInitBoard opts size popsize = do
 --- Types Relating to the Assignment
 
 -- Defs
-newtype Queen = Queen {queen :: Int} deriving (Show)
+newtype Queen where
+  Queen :: {queen :: Int} -> Queen
+  deriving (Show)
 
-newtype Rank = Rank {rank :: Int} deriving (Show, Eq)
-newtype File = File {file :: Int} deriving (Show, Eq)
-newtype Coordinate = Coordinate {coordinate :: (Rank, File)} deriving (Show, Eq)
+newtype Rank where
+  Rank :: {rank :: Int} -> Rank
+  deriving (Show, Eq)
 
-newtype To = To {to :: Coordinate} deriving (Show)
-newtype From = From {from :: Coordinate} deriving (Show)
-newtype Move = Move {move :: (From, To)} deriving (Show)
-newtype LookupRow = LookupRow {lookupRow :: (Queen, Coordinate)}
+newtype File where
+  File :: {file :: Int} -> File
+  deriving (Show, Eq)
+
+newtype Coordinate where
+  Coordinate :: {coordinate :: (Rank, File)} -> Coordinate
+  deriving (Show, Eq)
+
+newtype LookupRow where
+  LookupRow :: {lookupRow :: (Queen, Coordinate)} -> LookupRow
 
 type Row = Int
 type Column = Int
+
+type BoardSize = Int
+
 type Dims = (Row, Column)
-data LookupTable = LookupTable
-  { lookupTable :: ![LookupRow]
-  , deminsions :: !Dims
-  }
+
 type MutationRate = Double
 type CrossoverRate = Double
-type BoardSize = Int
+
 type Population = [LookupTable]
 
-data Configuration = Configuration
-  { boardSize :: Int
-  , popSize :: Int
-  , maxGen :: Int
-  , generationSize :: Int
-  , mutationRate :: Double
-  , crossOverRate :: Double
-  }
+data LookupTable where
+  LookupTable ::
+    { lookupTable :: ![LookupRow]
+    , deminsions :: !Dims
+    } ->
+    LookupTable
+
+data Configuration where
+  Configuration ::
+    { boardSize :: !Int
+    , popSize :: !Int
+    , maxGen :: !Int
+    , generationSize :: !Int
+    , mutationRate :: !Double
+    , crossOverRate :: !Double
+    , initBoard :: !CmdInitBoard
+    } ->
+    Configuration
 
 -- End Defs
 
@@ -233,8 +274,12 @@ instance Show Configuration where
       , maxGen = maxGen
       , mutationRate = mutRate
       , crossOverRate = cRate
+      , initBoard = initBoard
       } =
-      "Board Size: " ++ show brdSize ++ " | "
+      "Initial Board Layout: " ++ show initBoard
+        ++ "\nBoard Size: "
+        ++ show brdSize
+        ++ " | "
         ++ "Population Size: "
         ++ show popSize
         ++ " | "
@@ -255,46 +300,11 @@ instance Show Configuration where
 
 --- End types Relating to the Assignment
 
-queensThreaten :: Coordinate -> Coordinate -> Bool
-queensThreaten (Coordinate (Rank r1, File c1)) (Coordinate (Rank r2, File c2)) =
-  r1 == r2 || c1 == c2 || abs (r1 - r2) == abs (c1 - c2)
-
-numThreats :: LookupTable -> Int
-numThreats (LookupTable lookupTbl dims) = countThreats coords
- where
-  coords = map (snd . lookupRow) lookupTbl
-  countThreats [] = 0
-  countThreats (x : xs) = length (filter (queensThreaten x) xs) + countThreats xs
-
-coordinatesBetween :: Coordinate -> Coordinate -> [Coordinate]
-coordinatesBetween (Coordinate (Rank r1, File c1)) (Coordinate (Rank r2, File c2)) =
-  [Coordinate (Rank r, File c) | r <- [min r1 r2 + 1 .. max r1 r2 - 1], c <- [min c1 c2 + 1 .. max c1 c2 - 1]]
-
-isPathEmpty :: Coordinate -> Coordinate -> [LookupRow] -> Bool
-isPathEmpty from to lookupTbl =
-  all (\c -> c `notElem` map (snd . lookupRow) lookupTbl) (coordinatesBetween from to)
-
-moveQueenInLookup :: Move -> LookupTable -> Maybe LookupTable
-moveQueenInLookup (Move (From from, To to)) (LookupTable lookupTbl dims) =
-  let maybeQueen = lookupByCoordinate from lookupTbl
-   in case maybeQueen of
-        Just queen ->
-          if isPathEmpty from to lookupTbl
-            then Just $ LookupTable (LookupRow (queen, to) : filter ((/= from) . snd . lookupRow) lookupTbl) dims
-            else Nothing
-        Nothing -> Nothing
-
-lookupByCoordinate :: Coordinate -> [LookupRow] -> Maybe Queen
-lookupByCoordinate coord = fmap (fst . lookupRow) . find (\(LookupRow (_, c)) -> c == coord)
-
 initializeLookupTable :: Dims -> [Coordinate] -> LookupTable
 initializeLookupTable dims coords =
   LookupTable (zipWith (curry LookupRow) queens coords) dims
  where
   queens = map Queen [1 .. length coords]
-
-queensToMove :: Int -> Int -> IO [Int]
-queensToMove n threats = replicateM threats (randomRIO (1, n))
 
 -- Setting up the board
 coordinateValue :: Coordinate -> (Int, Int)
@@ -350,98 +360,99 @@ solved8QueensBoard = initializeLookupTable (8, 8) coordinates
     , Coordinate (Rank 8, File 3)
     ]
 
+randomNSizeBoard :: Int -> IO LookupTable
+randomNSizeBoard n =
+  randomNPositions n <&> initializeLookupTable (n, n)
+
+--- Algorithm Stuff
+
+queensThreaten :: Coordinate -> Coordinate -> Bool
+queensThreaten (Coordinate (Rank r1, File c1)) (Coordinate (Rank r2, File c2)) =
+  r1 == r2 || c1 == c2 || abs (r1 - r2) == abs (c1 - c2)
+
+numThreats :: LookupTable -> Int
+numThreats (LookupTable lookupTbl dims) = countThreats coords
+ where
+  coords = map (snd . lookupRow) lookupTbl
+  countThreats [] = 0
+  countThreats (x : xs) = length (filter (queensThreaten x) xs) + countThreats xs
+
 evolvePopulation :: MutationRate -> CrossoverRate -> Population -> Configuration -> IO Population
 evolvePopulation mutationRate crossoverRate initialPopulation cfg = do
-  let eliteSize = 5
+  let eliteSize = min 4 (length initialPopulation `div` 4)
       sortedPop = sortOn numThreats initialPopulation
       elites = take eliteSize sortedPop
-      nonElites = drop eliteSize sortedPop
+      totalFitness = sum (map numThreats sortedPop)
 
-  randNonElite1 <- randomElement nonElites
-  randNonElite2 <- randomElement nonElites
-  randBoard1 <- randomNSizeBoard (boardSize cfg)
+  parent1 <- randSelection sortedPop totalFitness
 
-  let newElites = elites ++ [randNonElite1, randNonElite2, randBoard1]
+  clsPrint (head elites) cfg
+
+  randomBoard <- randomNSizeBoard (boardSize cfg)
+
+  let newElites = parent1 : randomBoard : elites
 
   children <- replicateM (popSize - length newElites) (performCrossover sortedPop)
 
   return $ newElites ++ children
  where
   popSize = length initialPopulation
+  randSelection :: Population -> Int -> IO LookupTable
+  randSelection population totalFitness = do
+    randomFitness <- randomRIO (0, totalFitness)
+    let selected = findParent population randomFitness 0
+    return selected
+
+  findParent :: Population -> Int -> Int -> LookupTable
+  findParent [] _ _ = error "Something bad has occurred :("
+  findParent (p : ps) randomFitness acc
+    | acc + numThreats p >= randomFitness = p
+    | otherwise = findParent ps randomFitness (acc + numThreats p)
+
   performCrossover :: Population -> IO LookupTable
   performCrossover population = do
     parent1 <- randomElement population
     parent2 <- randomElement population
     child <- crossover crossoverRate parent1 parent2
-    mutateChild mutationRate child cfg
+    mutate mutationRate cfg child
 
-  crossover :: CrossoverRate -> LookupTable -> LookupTable -> IO LookupTable
-  crossover rate parent1@(LookupTable _ dims1) parent2@(LookupTable _ dims2) = do
-    r <- randomRIO (0, 1)
-    if r < rate
-      then do
-        crossoverPoint <- randomRIO (1, length (lookupTable parent1) - 1)
-        let (firstHalf, _) = splitAt crossoverPoint (lookupTable parent1)
-            (_, secondHalf) = splitAt crossoverPoint (lookupTable parent2)
-
-        let firstHalfPositions = map ((coordinate . snd) . lookupRow) firstHalf
-        let secondHalfPositions = map ((coordinate . snd) . lookupRow) secondHalf
-        let collisionExists = any (`elem` firstHalfPositions) secondHalfPositions
-
-        if collisionExists
-          then return parent1
-          else return $ LookupTable (firstHalf ++ secondHalf) dims1
-      else return parent1
-
-mutateChild :: MutationRate -> LookupTable -> Configuration -> IO LookupTable
-mutateChild rate child cfg = do
-  let LookupTable tableRows dims = child
-  r <- randomRIO (0, 1)
+crossover :: CrossoverRate -> LookupTable -> LookupTable -> IO LookupTable
+crossover rate parent1@(LookupTable _ dims1) parent2@(LookupTable _ _) = do
+  r <- randomRIO (0.0, 1.0)
   if r < rate
     then do
-      clsPrint child cfg
-      let (n, _) = dims
-      let threats = numThreats child
-      queensIndices <- queensToMove n threats
+      crossoverPoint <- randomRIO (1, length (lookupTable parent1) - 1)
+      let (firstHalf, _) = splitAt crossoverPoint (lookupTable parent1)
+          (_, secondHalf) = splitAt crossoverPoint (lookupTable parent2)
 
-      let occupiedPositions = map (coordinate . snd . lookupRow) tableRows
-      let unoccupiedPositions =
-            [(Rank r, File c) | r <- [1 .. n], c <- [1 .. n], (Rank r, File c) `notElem` occupiedPositions]
+      let firstHalfPositions = map ((coordinate . snd) . lookupRow) firstHalf
+      let secondHalfPositions = map ((coordinate . snd) . lookupRow) secondHalf
+      let collisionExists = any (`elem` firstHalfPositions) secondHalfPositions
 
-      newPositions <-
-        replicateM
-          threats
-          ( if null unoccupiedPositions
-              then return (Rank 1, File 1)
-              else randomElement unoccupiedPositions
-          )
+      if collisionExists
+        then crossover rate parent1 parent2
+        else return $ LookupTable (firstHalf ++ secondHalf) dims1
+    else return parent1
 
-      let mutated =
-            map
-              ( \row ->
-                  foldl
-                    ( \acc (i, newPos) ->
-                        updateRow i newPos acc
-                    )
-                    row
-                    (zip queensIndices newPositions)
-              )
-              tableRows
-      return $ LookupTable mutated dims
-    else return child
+mutate :: MutationRate -> Configuration -> LookupTable -> IO LookupTable
+mutate rate cfg child = do
+  let LookupTable tableRows dims = child
+  mutated <- forM tableRows $ \row -> do
+    r <- randomRIO (0.0, 1.0)
+    if r < rate
+      then do
+        let (n, _) = dims
+        let occupiedPositions = map (coordinate . snd . lookupRow) tableRows
+        let unoccupiedPositions =
+              [(Rank r, File c) | r <- [1 .. n], c <- [1 .. n], (Rank r, File c) `notElem` occupiedPositions]
+        newPos <- randomElement unoccupiedPositions
+        return $ updateRow (queen . fst $ lookupRow row) newPos row
+      else return row
+  return $ LookupTable mutated dims
  where
-  updateRow i newPos row@(LookupRow (q, Coordinate oldPos))
+  updateRow i newPos row@(LookupRow (q, _))
     | queen q == i = LookupRow (q, Coordinate newPos)
     | otherwise = row
-
-randomElement :: [a] -> IO a
-randomElement xs = do
-  i <- randomRIO (0, length xs - 1)
-  return $ xs !! i
-
-randomNSizeBoard :: Int -> IO LookupTable
-randomNSizeBoard n =
-  randomNPositions n <&> initializeLookupTable (n, n)
 
 main :: IO ()
 main = do
@@ -449,10 +460,12 @@ main = do
   ops <- mapM strToOps args >>= checkOps
   let (CmdCrossover crssover) = getDefaultOrOption ops (CmdCrossover 0.7)
       (CmdMutation mut) = getDefaultOrOption ops (CmdMutation 0.01)
-      (CmdPopulation pop) = getDefaultOrOption ops (CmdPopulation 8)
-      (CmdGeneration gen) = getDefaultOrOption ops (CmdGeneration 1000)
+      (CmdPopulation pop) = getDefaultOrOption ops (CmdPopulation 32)
+      (CmdGeneration gen) = getDefaultOrOption ops (CmdGeneration maxBound)
       (CmdSize size) = getDefaultOrOption ops (CmdSize 8)
-      config =
+
+  (cmdInit, initialPopulation) <- processInitBoard ops size pop
+  let config =
         Configuration
           { popSize = pop
           , mutationRate = mut
@@ -460,9 +473,9 @@ main = do
           , generationSize = 0
           , crossOverRate = crssover
           , boardSize = size
+          , initBoard = cmdInit
           }
 
-  initialPopulation <- processInitBoard ops size pop
   let loop acc population = do
         newPopulation <- evolvePopulation mut crssover population (config{generationSize = acc})
         let maybeSol = find ((== 0) . numThreats) newPopulation
@@ -479,5 +492,5 @@ main = do
             putStrLn ("\nFailed to find solution in " ++ show gen ++ " generations")
             putStrLn "Best Board: "
             print bestFit
-            print $ "Num Threats: " ++ show (numThreats bestFit)
+            putStrLn $ "Num Threats: " ++ show (numThreats bestFit)
    in loop 0 initialPopulation
