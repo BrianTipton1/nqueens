@@ -1,4 +1,5 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE InstanceSigs #-}
 {-# LANGUAGE LambdaCase #-}
@@ -14,7 +15,7 @@ import Data.Data (Typeable)
 import Data.Foldable (Foldable (foldl'), find)
 import Data.Function (on)
 import Data.Functor ((<&>))
-import Data.List (isSubsequenceOf, nub, sortBy, sortOn)
+import Data.List (isSubsequenceOf, nub, sortBy, sortOn, sort)
 import Data.Maybe (fromMaybe)
 import System.Environment (getArgs)
 import System.Exit (ExitCode (ExitFailure, ExitSuccess), exitSuccess, exitWith)
@@ -386,13 +387,22 @@ evolvePopulation mutationRate crossoverRate initialPopulation cfg = do
 
   parent1 <- randSelection sortedPop totalFitness
 
-  clsPrint (head elites) cfg
+  let elite1 = head elites
+      elite2 = parent1
+
+  elite <-
+    if numThreats elite1 == numThreats elite2
+      then do
+        coin <- randomRIO (0, 1) :: IO Int
+        return $ if coin == 0 then elite1 else elite2
+      else return elite1
 
   randomBoard <- randomNSizeBoard (boardSize cfg)
-
-  let newElites = parent1 : randomBoard : elites
+  crssd <- performCrossover [randomBoard, elite] >>= mutate mutationRate cfg
+  let newElites = parent1 : randomBoard : crssd : elites
 
   children <- replicateM (popSize - length newElites) (performCrossover sortedPop)
+  clsPrint (head (sortOn numThreats newElites)) cfg
 
   return $ newElites ++ children
  where

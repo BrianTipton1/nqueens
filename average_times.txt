@@ -1,6 +1,6 @@
 Average Times for nqueens.cabal
 ===============================
-Average time for n = 4: 152.20ms
-Average time for n = 7: 9670.00ms
-Average time for n = 8: 150538.00ms
-Average time for n = 9: 185746.40ms
+Average time for n = 4: 373.40ms
+Average time for n = 7: 23355.40ms
+Average time for n = 8: 2094.20ms
+Average time for n = 9: 60996.40ms
